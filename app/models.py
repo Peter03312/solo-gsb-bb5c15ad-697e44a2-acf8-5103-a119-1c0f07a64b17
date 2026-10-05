@@ -77,3 +77,57 @@ class ScheduleResponse(BaseModel):
     schedule: list[ScheduleItem] | None = None
     blockers: list[BlockingConstraint] | None = None
     status: str  # "optimal" | "feasible" | "infeasible" | "unknown"
+
+
+# ---- 变更影响预演（/api/schedule/diff） ----
+
+
+class ScheduleDiffRequest(BaseModel):
+    current: ScheduleRequest = Field(..., description="当前（变更前）排程请求")
+    modified: ScheduleRequest = Field(..., description="修改后（变更后）的排程请求")
+
+
+class TimeChange(BaseModel):
+    before_utc: str
+    after_utc: str
+    delta_minutes: float = Field(..., description="after - before，正数表示推迟，负数表示提前")
+
+
+class ServiceChange(BaseModel):
+    service_id: str
+    name: str
+    deploy_start: TimeChange | None = Field(None, description="部署开始时刻的变化；未变化为 null")
+    occupied_until: TimeChange | None = Field(
+        None, description="占用结束时刻（部署结束 + 回滚窗口）的变化；未变化为 null")
+
+
+class ServiceRef(BaseModel):
+    service_id: str
+    name: str
+
+
+class ScheduleDiff(BaseModel):
+    changed: list[ServiceChange] = Field(..., description="两侧都存在、开始或占用结束时刻发生变化的服务")
+    added: list[ServiceRef] = Field(..., description="仅在 modified 中出现的服务")
+    removed: list[ServiceRef] = Field(..., description="仅在 current 中出现的服务")
+
+
+class ValidationError(BaseModel):
+    code: str
+    field: str | None = None
+    message: str
+    suggestions: list[str] | None = None
+
+
+class RequestFailure(BaseModel):
+    kind: str  # "validation" | "infeasible" | "unknown"
+    status: str | None = None  # 求解器状态（infeasible/unknown）
+    errors: list[ValidationError] | None = None  # kind=validation 时的完整输入错误
+    blockers: list[BlockingConstraint] | None = None  # kind=infeasible/unknown 时的阻塞约束组合
+
+
+class ScheduleDiffResponse(BaseModel):
+    feasible: bool
+    diff: ScheduleDiff | None = None
+    failures: dict[str, RequestFailure] | None = Field(
+        None, description="任一请求输入错误或无解时，按 current/modified 给出对应错误，不输出差异")

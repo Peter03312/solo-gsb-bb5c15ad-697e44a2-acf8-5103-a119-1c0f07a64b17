@@ -148,15 +148,142 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 `dst_ambiguous`（重复时间）的建议分别给出回拨前后的两个绝对时刻（第一次/第二次）。
 这些值可直接粘贴回输入框重新提交。
 
+### `POST /api/schedule/diff` — 变更影响预演
+
+变更评审时，提交一份**当前排程请求**和一份**修改后的请求**，系统分别独立求解，
+再按**服务 ID** 对齐两侧结果，预演变更会让哪些服务的发布时刻发生移动。
+
+请求体：
+
+```json
+{
+  "current": { ...一份完整的 /api/schedule 请求体... },
+  "modified": { ...一份完整的 /api/schedule 请求体... }
+}
+```
+
+比较规则：
+
+- `changed`：两侧都存在、且**部署开始**或**占用结束**（部署结束 + 回滚窗口）的 UTC 时刻发生变化的服务，
+  给出变化前后的 UTC 时刻与变化分钟数（`delta_minutes` 正为推迟、负为提前；未变化的字段为 `null`）；
+- `added` / `removed`：仅在 `modified` 中出现（新增）/ 仅在 `current` 中出现（被移除）的服务；
+- 两份请求结果完全一致时，三个列表均为空（空差异）。
+- **任一请求输入错误或无解时，不输出差异结果**：在 `failures` 中按 `current` / `modified`
+  分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`），
+  与直接调用 `/api/schedule` 得到的内容一致。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule/diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "current": {
+      "services": [
+        {"id": "payments", "name": "支付服务", "timezone": "UTC",
+         "duration_minutes": 60, "rollback_minutes": 30,
+         "windows": [{"start": "2026-11-13T00:00:00Z", "end": "2026-11-13T06:00:00Z", "timezone": "UTC"}]}
+      ],
+      "max_solve_seconds": 10
+    },
+    "modified": {
+      "services": [
+        {"id": "payments", "name": "支付服务", "timezone": "UTC",
+         "duration_minutes": 60, "rollback_minutes": 30,
+         "windows": [{"start": "2026-11-13T00:00:00Z", "end": "2026-11-13T06:00:00Z", "timezone": "UTC"}]}
+      ],
+      "freezes": [
+        {"label": "临时冻结", "start": "2026-11-13T00:00:00Z", "end": "2026-11-13T01:00:00Z", "timezone": "UTC"}
+      ],
+      "max_solve_seconds": 10
+    }
+  }'
+```
+
+**有变化（200）**：
+
+```json
+{
+  "feasible": true,
+  "diff": {
+    "changed": [
+      {
+        "service_id": "payments",
+        "name": "支付服务",
+        "deploy_start": {
+          "before_utc": "2026-11-13T00:00:00+00:00",
+          "after_utc": "2026-11-13T01:00:00+00:00",
+          "delta_minutes": 60.0
+        },
+        "occupied_until": {
+          "before_utc": "2026-11-13T01:30:00+00:00",
+          "after_utc": "2026-11-13T02:30:00+00:00",
+          "delta_minutes": 60.0
+        }
+      }
+    ],
+    "added": [],
+    "removed": []
+  },
+  "failures": null
+}
+```
+
+只调整回滚时长、开始时刻不变时，`deploy_start` 为 `null`，仅 `occupied_until` 给出变化。
+两份请求无差异时返回 `"changed": [], "added": [], "removed": []`。
+
+**某一侧输入错误（422）**：不输出 `diff`，在 `failures` 中指明出错的一侧及完整错误列表：
+
+```json
+{
+  "feasible": false,
+  "diff": null,
+  "failures": {
+    "modified": {
+      "kind": "validation",
+      "status": null,
+      "errors": [
+        {"code": "bad_timezone", "field": "services[payments].timezone",
+         "message": "服务 payments: 未知时区 'Mars/Olympus'", "suggestions": null}
+      ],
+      "blockers": null
+    }
+  }
+}
+```
+
+**某一侧无解（200，`feasible=false`）**：`kind` 为 `infeasible`（求解器超时未判定时为 `unknown`），
+`blockers` 为该侧的阻塞约束组合：
+
+```json
+{
+  "feasible": false,
+  "diff": null,
+  "failures": {
+    "current": {
+      "kind": "infeasible",
+      "status": "infeasible",
+      "errors": null,
+      "blockers": [
+        {"code": "freeze:维护冻结：全天封网:payments", "message": "…期间服务 支付服务（payments）不得部署或处于回滚窗口内"}
+      ]
+    }
+  }
+}
+```
+
+两侧同时失败时 `failures` 中会同时包含 `current` 与 `modified` 两个键。
+
 ## 项目结构
 
 ```
 app/
-  main.py        FastAPI 入口（/api/schedule、/api/health、静态页面）
+  main.py        FastAPI 入口（/api/schedule、/api/schedule/diff、/api/health、静态页面）
   models.py      请求/响应 Pydantic 模型
   times.py       时区解析与 DST 重复/不存在分类（zoneinfo fold 规则）
   validator.py   输入校验：DST、引用完整性、依赖环检测、区间合法性
   scheduler.py   CP-SAT 建模、求解、不可行假设核（blocking core）提取
+  diff.py        变更影响预演：双请求执行与按服务 ID 的时刻对齐求差
   web/index.html 操作页面（原生 JS，内置 3 个示例场景）
 Dockerfile
 docker-compose.yml
