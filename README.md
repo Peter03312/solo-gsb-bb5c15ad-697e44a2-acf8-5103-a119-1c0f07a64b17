@@ -148,11 +148,152 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 `dst_ambiguous`（重复时间）的建议分别给出回拨前后的两个绝对时刻（第一次/第二次）。
 这些值可直接粘贴回输入框重新提交。
 
+### `POST /api/schedule/diff`（变更影响预演）
+
+提交**当前排程请求**（`base`）与**修改后的请求**（`candidate`），系统分别求解后按服务 ID
+对齐结果，输出变更影响：
+
+- `changed`：两侧都存在、但**部署开始时间**或**占用结束时间（含回滚）**发生变化的服务，
+  含变化前后 UTC 时刻与变化分钟数（后 − 前）；
+- `added` / `removed`：仅在新请求中出现 / 被移除的服务及其在所属排程中的时刻；
+- 任一请求**输入错误**（422，逐侧给出完整错误）或**无解**（200，逐侧给出阻塞约束组合）时，
+  **不输出差异结果**（`diff` 为 `null`）；
+- 两份请求求解结果完全一致时返回空差异（`changed`/`added`/`removed` 均为 `[]`）。
+
+请求体：
+
+```json
+{
+  "base":      { "services": [ ... ], "dependencies": [ ... ], "...": "同 /api/schedule 请求体" },
+  "candidate": { "services": [ ... ], "dependencies": [ ... ], "...": "同 /api/schedule 请求体" }
+}
+```
+
+**两侧均可行（200，`status=ok`）**：
+
+```json
+{
+  "status": "ok",
+  "diff": {
+    "changed": [
+      {
+        "service_id": "payments",
+        "name": "支付服务",
+        "deploy_start_before_utc": "2026-11-13T21:00:00+00:00",
+        "deploy_start_after_utc": "2026-11-13T22:00:00+00:00",
+        "deploy_start_delta_minutes": 60,
+        "occupied_until_before_utc": "2026-11-13T22:45:00+00:00",
+        "occupied_until_after_utc": "2026-11-13T23:45:00+00:00",
+        "occupied_until_delta_minutes": 60
+      },
+      {
+        "service_id": "ledger",
+        "name": "账务批处理",
+        "deploy_start_before_utc": "2026-11-13T22:45:00+00:00",
+        "deploy_start_after_utc": "2026-11-13T23:45:00+00:00",
+        "deploy_start_delta_minutes": 60,
+        "occupied_until_before_utc": "2026-11-14T01:45:00+00:00",
+        "occupied_until_after_utc": "2026-11-14T02:45:00+00:00",
+        "occupied_until_delta_minutes": 60
+      }
+    ],
+    "added": [
+      {"service_id": "notify", "name": "通知服务",
+       "deploy_start_utc": "2026-11-14T00:00:00+00:00",
+       "occupied_until_utc": "2026-11-14T00:45:00+00:00"}
+    ],
+    "removed": [
+      {"service_id": "legacy-report", "name": "旧报表",
+       "deploy_start_utc": "2026-11-14T00:00:00+00:00",
+       "occupied_until_utc": "2026-11-14T01:00:00+00:00"}
+    ]
+  },
+  "base": null,
+  "candidate": null
+}
+```
+
+**某一侧无解（200，`status=base_infeasible | candidate_infeasible | both_infeasible`）**：
+`diff` 为 `null`，对应侧给出完整阻塞约束组合（结构同 `/api/schedule` 的 `blockers`）：
+
+```json
+{
+  "status": "candidate_infeasible",
+  "diff": null,
+  "base": null,
+  "candidate": {
+    "status": "infeasible",
+    "blockers": [
+      {"code": "freeze:周末封网:payments", "message": "周末封网（…）期间服务 支付服务（payments）不得部署或处于回滚窗口内"}
+    ]
+  }
+}
+```
+
+**某一侧输入错误（422）**：逐侧给出完整校验错误（结构同 `/api/schedule` 的 422），无错误的一侧为 `null`：
+
+```json
+{
+  "errors": {
+    "base": null,
+    "candidate": [
+      {"code": "dst_nonexistent", "field": "services[x].windows[0].start",
+       "message": "…在夏令时前拨时不存在…", "suggestions": ["…", "…"]}
+    ]
+  }
+}
+```
+
+#### 调用示例（curl）
+
+```bash
+curl -s http://localhost:8000/api/schedule/diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base": {
+      "services": [
+        {"id": "payments", "name": "支付服务", "timezone": "Europe/Berlin",
+         "duration_minutes": 45, "rollback_minutes": 60,
+         "resources": ["payment-db"],
+         "windows": [{"start": "2026-11-13T22:00", "end": "2026-11-14T05:00", "timezone": "Europe/Berlin"}]},
+        {"id": "ledger", "name": "账务批处理", "timezone": "America/New_York",
+         "duration_minutes": 60, "rollback_minutes": 120,
+         "resources": ["payment-db"],
+         "windows": [{"start": "2026-11-13T16:00", "end": "2026-11-14T23:00", "timezone": "America/New_York"}]},
+        {"id": "legacy-report", "name": "旧报表", "timezone": "UTC",
+         "duration_minutes": 30, "rollback_minutes": 30,
+         "windows": [{"start": "2026-11-14T00:00", "end": "2026-11-14T08:00", "timezone": "UTC"}]}
+      ],
+      "dependencies": [{"upstream": "payments", "downstream": "ledger", "gap_minutes": 60}]
+    },
+    "candidate": {
+      "services": [
+        {"id": "payments", "name": "支付服务", "timezone": "Europe/Berlin",
+         "duration_minutes": 45, "rollback_minutes": 60,
+         "resources": ["payment-db"],
+         "windows": [{"start": "2026-11-13T23:00", "end": "2026-11-14T06:00", "timezone": "Europe/Berlin"}]},
+        {"id": "ledger", "name": "账务批处理", "timezone": "America/New_York",
+         "duration_minutes": 60, "rollback_minutes": 120,
+         "resources": ["payment-db"],
+         "windows": [{"start": "2026-11-13T16:00", "end": "2026-11-14T23:00", "timezone": "America/New_York"}]},
+        {"id": "notify", "name": "通知服务", "timezone": "UTC",
+         "duration_minutes": 15, "rollback_minutes": 30,
+         "windows": [{"start": "2026-11-14T00:00", "end": "2026-11-14T08:00", "timezone": "UTC"}]}
+      ],
+      "dependencies": [{"upstream": "payments", "downstream": "ledger", "gap_minutes": 60}]
+    }
+  }'
+```
+
+上面的 `candidate` 把 payments 的候选窗整体后移 1 小时、移除 legacy-report 并新增 notify：
+返回中 `changed` 给出 payments 与 ledger（受依赖推动）各后移 60 分钟的前后 UTC 时刻，
+`added`/`removed` 分别列出 notify 与 legacy-report。
+
 ## 项目结构
 
 ```
 app/
-  main.py        FastAPI 入口（/api/schedule、/api/health、静态页面）
+  main.py        FastAPI 入口（/api/schedule、/api/schedule/diff、/api/health、静态页面）
   models.py      请求/响应 Pydantic 模型
   times.py       时区解析与 DST 重复/不存在分类（zoneinfo fold 规则）
   validator.py   输入校验：DST、引用完整性、依赖环检测、区间合法性
